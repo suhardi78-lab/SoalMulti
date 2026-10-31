@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="id"><head>
 <meta charset="UTF-8">
@@ -396,7 +395,7 @@
       <div class="panel-row" style="margin-bottom:12px;">
         <button class="btn btn-success btn-sm" onclick="bukaModalTambahSpreadsheet()">+ Tambah Link Spreadsheet Kelas</button>
       </div>
-      <div id="statusSpreadsheetMap"><div class="alert-success">✅ Tes kirim data kelas <strong>X DKV 2</strong> BERHASIL! Header kolom dibuat otomatis pada Spreadsheet jika kosong.</div></div>
+      <div id="statusSpreadsheetMap"></div>
       <div style="overflow-x:auto;">
         <table class="crud-table" id="tabelSpreadsheet">
           <thead>
@@ -660,7 +659,7 @@
 <pre id="kodeGasText" style="background:var(--bg-primary); padding:10px; border-radius:4px; overflow-x:auto; font-size:11px; border:1px solid var(--border-color); color:var(--text-primary); -webkit-user-select:text; user-select:text;">function doPost(e) {
   var lock = LockService.getScriptLock();
   try {
-    lock.waitLock(10000); // Tunggu antrean maksimal 10 detik agar tidak bentrok antar HP
+    lock.waitLock(15000); // Tunggu antrean maksimal 15 detik agar aman antar pengiriman
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
     var data = JSON.parse(e.postData.contents);
 
@@ -682,6 +681,29 @@
         "Auto Submit",
         "Waktu Selesai"
       ]);
+    }
+
+    // PENCEGAHAN DATA GANDA (Deduplikasi di Spreadsheet):
+    // Cek apakah data siswa dengan nama, nomor, kelas, mapel sudah ada di sheet
+    var lastRow = sheet.getLastRow();
+    if (lastRow > 1 && data.nama && data.kelas && data.mataPelajaran && data.nama !== "Uji Coba Sistem") {
+      var range = sheet.getRange(2, 2, lastRow - 1, 4).getValues(); // Ambil Kolom Nama(B), No(C), Kelas(D), Mapel(E)
+      var targetNama = String(data.nama).trim().toLowerCase();
+      var targetNomor = String(data.nomor || '').trim().toLowerCase();
+      var targetKelas = String(data.kelas).trim().toLowerCase();
+      var targetMapel = String(data.mataPelajaran).trim().toLowerCase();
+
+      for (var r = 0; r < range.length; r++) {
+        var rowNama = String(range[r][0] || '').trim().toLowerCase();
+        var rowNomor = String(range[r][1] || '').trim().toLowerCase();
+        var rowKelas = String(range[r][2] || '').trim().toLowerCase();
+        var rowMapel = String(range[r][3] || '').trim().toLowerCase();
+
+        if (rowNama === targetNama && rowNomor === targetNomor && rowKelas === targetKelas && rowMapel === targetMapel) {
+          // Data sudah tercatat sebelumnya di spreadsheet, jangan buat baris ganda
+          return ContentService.createTextOutput(JSON.stringify({result: "duplicate_skipped", message: "Data sudah ada di spreadsheet"})).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
     }
 
     sheet.appendRow([
@@ -1052,7 +1074,43 @@ function manualSyncPrompt() {
   }
 }
 
-// --- SISTEM ANTREAN SYNC OFFLINE-TO-ONLINE ---
+// --- SISTEM ANTREAN SYNC & ANTI-DOBEL SPREADSHEET ---
+function generateSubmissionKey(payload) {
+  if (!payload) return '';
+  const nama = String(payload.nama || '').trim().toLowerCase();
+  const nomor = String(payload.nomor || '').trim().toLowerCase();
+  const kelas = String(payload.kelas || '').trim().toLowerCase();
+  const mapel = String(payload.mataPelajaran || '').trim().toLowerCase();
+  return nama + '_' + nomor + '_' + kelas + '_' + mapel;
+}
+
+function getSentSubmissionKeys() {
+  try {
+    return JSON.parse(localStorage.getItem('sentSubmissionKeys') || '[]');
+  } catch(e) {
+    return [];
+  }
+}
+
+function catatSentSubmissionKey(key) {
+  if (!key) return;
+  const list = getSentSubmissionKeys();
+  if (!list.includes(key)) {
+    list.push(key);
+    try {
+      localStorage.setItem('sentSubmissionKeys', JSON.stringify(list));
+      AppStorage.setItem('sentSubmissionKeys', JSON.stringify(list));
+    } catch(e) {}
+  }
+}
+
+function isSubmissionAlreadySent(payload) {
+  if (!payload || payload.nama === 'Uji Coba Sistem') return false;
+  const key = generateSubmissionKey(payload);
+  const sentList = getSentSubmissionKeys();
+  return sentList.includes(key);
+}
+
 function getPendingSyncQueue() {
   try {
     return JSON.parse(localStorage.getItem('pendingSyncQueue') || '[]');
@@ -1072,15 +1130,25 @@ function setPendingSyncQueue(queue) {
 }
 
 function tambahKeAntreanSync(item) {
+  if (!item || !item.payload) return;
+  const subKey = generateSubmissionKey(item.payload);
+  // Cegah masuk antrean jika data siswa ini sudah terkirim sukses sebelumnya
+  if (isSubmissionAlreadySent(item.payload)) {
+    return;
+  }
   const queue = getPendingSyncQueue();
-  // Cegah duplikasi persis berdasarkan nama, kelas, mataPelajaran, waktuSelesai
-  const exists = queue.some(q =>
-    q.payload && item.payload &&
-    q.payload.nama === item.payload.nama &&
-    q.payload.kelas === item.payload.kelas &&
-    q.payload.mataPelajaran === item.payload.mataPelajaran &&
-    q.payload.waktuSelesai === item.payload.waktuSelesai
-  );
+  // Cegah duplikasi persis di antrean berdasarkan subKey atau nama/kelas/mapel
+  const exists = queue.some(q => {
+    if (!q.payload) return false;
+    const qKey = generateSubmissionKey(q.payload);
+    if (subKey && qKey && subKey === qKey) return true;
+    return (
+      q.payload.nama === item.payload.nama &&
+      q.payload.kelas === item.payload.kelas &&
+      q.payload.mataPelajaran === item.payload.mataPelajaran &&
+      q.payload.waktuSelesai === item.payload.waktuSelesai
+    );
+  });
   if (!exists) {
     queue.push(item);
     setPendingSyncQueue(queue);
@@ -1259,17 +1327,27 @@ mapelDb.forEach(m => {
 });
 
 function simpanSiswaDb() {
+  try {
+    localStorage.setItem('dataSiswaDb', JSON.stringify(dataSiswaDb));
+  } catch(e) {}
   AppStorage.setItem('dataSiswaDb', JSON.stringify(dataSiswaDb));
   renderTabelSiswa();
   updateSelectKelasFilter();
 }
 
 function simpanSpreadsheetMapDb() {
+  try {
+    localStorage.setItem('spreadsheetMapDb', JSON.stringify(spreadsheetMapDb));
+  } catch(e) {}
   AppStorage.setItem('spreadsheetMapDb', JSON.stringify(spreadsheetMapDb));
   renderTabelSpreadsheet();
 }
 
 function simpanMapelDb() {
+  try {
+    localStorage.setItem('mapelDb', JSON.stringify(mapelDb));
+    localStorage.setItem('soalMapelDb', JSON.stringify(soalMapelDb));
+  } catch(e) {}
   AppStorage.setItem('mapelDb', JSON.stringify(mapelDb));
   AppStorage.setItem('soalMapelDb', JSON.stringify(soalMapelDb));
   renderTabelMapel();
@@ -1279,6 +1357,9 @@ function simpanMapelDb() {
 }
 
 function simpanJadwalUjianDb() {
+  try {
+    localStorage.setItem('jadwalUjianDb', JSON.stringify(jadwalUjianDb));
+  } catch(e) {}
   AppStorage.setItem('jadwalUjianDb', JSON.stringify(jadwalUjianDb));
   renderTabelJadwal();
 }
@@ -1328,6 +1409,18 @@ function simpanJadwalModal() {
 
   if (!mataPelajaran || !kelas || !tanggal || !jamMulai || !jamSelesai) {
     alert('❌ Semua bidang jadwal harus diisi!');
+    return;
+  }
+
+  // Cek duplikasi jadwal untuk mapel, kelas, dan tanggal yang sama
+  const isDuplicate = jadwalUjianDb.some((j, idx) => {
+    if (index >= 0 && idx === index) return false;
+    return j.mataPelajaran.trim().toLowerCase() === mataPelajaran.toLowerCase() &&
+           j.kelas.trim().toLowerCase() === kelas.toLowerCase() &&
+           j.tanggal === tanggal;
+  });
+  if (isDuplicate) {
+    alert('❌ Jadwal untuk mata pelajaran, kelas, dan tanggal ini sudah ada!');
     return;
   }
 
@@ -1620,6 +1713,18 @@ function simpanSiswaModal() {
     return;
   }
 
+  // Cek duplikasi siswa berdasarkan nama, nomor absen, dan kelas
+  const isDuplicate = dataSiswaDb.some((s, idx) => {
+    if (index >= 0 && idx === index) return false;
+    return s.nama.trim().toLowerCase() === nama.toLowerCase() &&
+           s.nomor.trim().toLowerCase() === nomor.toLowerCase() &&
+           s.kelas.trim().toLowerCase() === kelas.toLowerCase();
+  });
+  if (isDuplicate) {
+    alert('❌ Siswa dengan Nama, No Absen, dan Kelas tersebut sudah terdaftar!');
+    return;
+  }
+
   if (index >= 0) {
     dataSiswaDb[index] = { nama, nomor, kelas };
   } else {
@@ -1860,6 +1965,16 @@ function simpanSpreadsheetModal() {
 
   if (!kelas) {
     alert('❌ Kelas harus diisi!');
+    return;
+  }
+
+  // Cek duplikasi mapping kelas spreadsheet
+  const isDuplicate = spreadsheetMapDb.some((item, idx) => {
+    if (index >= 0 && idx === index) return false;
+    return item.kelas.trim().toLowerCase() === kelas.toLowerCase();
+  });
+  if (isDuplicate) {
+    alert('❌ Integrasi spreadsheet untuk kelas ' + kelas + ' sudah ada!');
     return;
   }
 
@@ -2398,14 +2513,14 @@ function exportToExcel() {
 
 function resetDataSiswa() {
   if (!confirm('Yakin ingin menghapus semua data siswa?')) return;
-  ['statusUjian','waktuMulai','jawaban','dataSiswa','pelanggaran','jumlahPelanggaran','nilai','benar','autoSubmit','waktuSelesai','soalUrutan','urutanOpsiPerSoal','waktuJawaban','pendingSheetPayload','pendingSyncQueue','draftIdentitasSiswa','hasilUjianTerakhir'].forEach(k => localStorage.removeItem(k));
+  ['statusUjian','waktuMulai','jawaban','dataSiswa','pelanggaran','jumlahPelanggaran','nilai','benar','autoSubmit','waktuSelesai','soalUrutan','urutanOpsiPerSoal','waktuJawaban','pendingSheetPayload','pendingSyncQueue','draftIdentitasSiswa','hasilUjianTerakhir','sentSubmissionKeys'].forEach(k => localStorage.removeItem(k));
   document.getElementById('statusResetSiswa').innerHTML = '<div class="alert-success">✅ Semua data siswa berhasil dihapus</div>';
   setTimeout(() => { document.getElementById('statusResetSiswa').innerHTML = ''; }, 3000);
 }
 
 function hapusDataTerEmbed() {
   if (!confirm('Yakin ingin menghapus semua data ter-embed dan data siswa? Semua bekas data ujian akan dibersihkan.')) return;
-  ['statusUjian','waktuMulai','jawaban','dataSiswa','pelanggaran','jumlahPelanggaran','nilai','benar','autoSubmit','waktuSelesai','soalUrutan','urutanOpsiPerSoal','waktuJawaban','pendingSheetPayload','pendingSyncQueue','draftIdentitasSiswa','hasilUjianTerakhir'].forEach(k => localStorage.removeItem(k));
+  ['statusUjian','waktuMulai','jawaban','dataSiswa','pelanggaran','jumlahPelanggaran','nilai','benar','autoSubmit','waktuSelesai','soalUrutan','urutanOpsiPerSoal','waktuJawaban','pendingSheetPayload','pendingSyncQueue','draftIdentitasSiswa','hasilUjianTerakhir','sentSubmissionKeys'].forEach(k => localStorage.removeItem(k));
   statusUjian = null; dataSiswa = null; jawaban = {}; pelanggaran = []; jumlahPelanggaran = 0; soalUrutan = []; urutanOpsiPerSoal = {}; waktuJawaban = {};
   ['nama','nomor','kelas','tokenUjian'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
   ['soalContainer','resultArea','watermarkOverlay'].forEach(id => { const el = document.getElementById(id); if (el) el.innerHTML = ''; });
@@ -2614,6 +2729,7 @@ function kumpulkan() { const elapsed = Math.floor((Date.now() - waktuMulai) / 10
 function autoSubmit() { submitUjian(true); }
 
 let isSendingSheet = false;
+let isSubmittingExam = false;
 
 async function kirimKeGoogleSheetDirect(payload, url) {
   if (!url) return false;
@@ -2677,6 +2793,13 @@ async function prosesAntreanSheet() {
 
   for (let i = 0; i < activeQueue.length; i++) {
     const item = activeQueue[i];
+    const subKey = generateSubmissionKey(item.payload);
+
+    // Cek apakah item ini sudah pernah terkirim sukses (mencegah duplikasi ganda)
+    if (isSubmissionAlreadySent(item.payload)) {
+      continue;
+    }
+
     const url = item.targetUrl || getTargetSpreadsheetUrl(item.payload ? item.payload.kelas : '');
     if (!url) {
       // URL belum ada, simpan tetap di antrean
@@ -2686,11 +2809,15 @@ async function prosesAntreanSheet() {
     const success = await kirimKeGoogleSheetDirect(item.payload, url);
     if (success) {
       successfulSends++;
+      if (subKey && item.payload && item.payload.nama !== 'Uji Coba Sistem') {
+        catatSentSubmissionKey(subKey);
+      }
       // Update hasilUjianTerakhir jika cocok
       const currentHasil = JSON.parse(localStorage.getItem('hasilUjianTerakhir') || 'null');
       if (currentHasil && item.payload && currentHasil.nama === item.payload.nama && currentHasil.kelas === item.payload.kelas) {
         currentHasil.isSent = true;
         localStorage.setItem('hasilUjianTerakhir', JSON.stringify(currentHasil));
+        AppStorage.setItem('hasilUjianTerakhir', JSON.stringify(currentHasil));
       }
     } else {
       remainingQueue.push(item);
@@ -2723,6 +2850,22 @@ async function prosesAntreanSheet() {
 
 async function kirimKeGoogleSheet(payload, customUrl) {
   const targetUrl = customUrl || getTargetSpreadsheetUrl(payload.kelas);
+  const subKey = generateSubmissionKey(payload);
+
+  // Jika sudah pernah terkirim sukses sebelumnya, tandai langsung dan hindari kirim ulang
+  if (isSubmissionAlreadySent(payload)) {
+    const currentHasil = JSON.parse(localStorage.getItem('hasilUjianTerakhir') || 'null');
+    if (currentHasil) {
+      currentHasil.isSent = true;
+      localStorage.setItem('hasilUjianTerakhir', JSON.stringify(currentHasil));
+      AppStorage.setItem('hasilUjianTerakhir', JSON.stringify(currentHasil));
+    }
+    const sheetStatusElem = document.getElementById('sheetSendingStatus');
+    if (sheetStatusElem) {
+      sheetStatusElem.innerHTML = '<div class="alert-success">✅ Data nilai sudah tercatat di Google Spreadsheet sebelumnya.</div>';
+    }
+    return true;
+  }
 
   // Buat queue item unik
   const queueItem = {
@@ -2765,6 +2908,9 @@ async function kirimKeGoogleSheet(payload, customUrl) {
 }
 
 function submitUjian(isAutoSubmit) {
+  if (isSubmittingExam || statusUjian === 'selesai') return;
+  isSubmittingExam = true;
+
   clearInterval(timerInterval); let benar = 0;
   soalUrutan.forEach(soalIdx => { if (jawaban[soalIdx] == soalAktif[soalIdx].a) benar++; });
   const totalSoalCount = soalUrutan.length || 1;
@@ -2808,6 +2954,7 @@ function submitUjian(isAutoSubmit) {
     };
     kirimKeGoogleSheet(payload, targetUrl);
   }
+  isSubmittingExam = false;
 }
 
 function tampilkanHasil(nilai, benar, isAutoSubmit) {
@@ -2846,7 +2993,7 @@ function tutupModal(id) { document.getElementById(id).style.display = 'none'; }
 function bukaModalReset() { document.getElementById('resetModal').style.display = 'flex'; document.getElementById('passwordGuru').value = ''; }
 function konfirmasiReset() {
   const pwd = document.getElementById('passwordGuru').value;
-  if (pwd === PASSWORD_GURU) { if (confirm('Yakin ingin mereset ujian siswa ini?')) { ['statusUjian','waktuMulai','jawaban','dataSiswa','pelanggaran','jumlahPelanggaran','nilai','benar','autoSubmit','waktuSelesai','soalUrutan','urutanOpsiPerSoal','waktuJawaban','pendingSheetPayload','pendingSyncQueue','draftIdentitasSiswa','hasilUjianTerakhir'].forEach(k => localStorage.removeItem(k)); isFullscreenActive = false; exitFullscreen(); hapusWatermark(); alert('Ujian berhasil direset!'); location.reload(); } } else { alert('Password salah!'); }
+  if (pwd === PASSWORD_GURU) { if (confirm('Yakin ingin mereset ujian siswa ini?')) { ['statusUjian','waktuMulai','jawaban','dataSiswa','pelanggaran','jumlahPelanggaran','nilai','benar','autoSubmit','waktuSelesai','soalUrutan','urutanOpsiPerSoal','waktuJawaban','pendingSheetPayload','pendingSyncQueue','draftIdentitasSiswa','hasilUjianTerakhir','sentSubmissionKeys'].forEach(k => localStorage.removeItem(k)); isFullscreenActive = false; exitFullscreen(); hapusWatermark(); alert('Ujian berhasil direset!'); location.reload(); } } else { alert('Password salah!'); }
 }
 
 window.addEventListener('online', () => {
